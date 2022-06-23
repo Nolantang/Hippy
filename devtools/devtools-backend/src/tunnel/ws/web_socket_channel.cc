@@ -27,19 +27,25 @@
 
 #include "devtools_base/common/macros.h"
 #include "devtools_base/logging.h"
+#include "devtools_base/tdf_string_util.h"
+#include "tunnel/ws/web_socket_no_tls_client.h"
+#include "tunnel/ws/web_socket_tls_client.h"
 
-typedef WSClient::connection_ptr WSConnectionPtr;
+constexpr char kWssKey[] = "wss";
 
 namespace hippy::devtools {
 
 WebSocketChannel::WebSocketChannel(const std::string& ws_uri) {
   ws_uri_ = ws_uri;
-  ws_client_.set_access_channels(websocketpp::log::alevel::fail);
-  ws_client_.set_error_channels(websocketpp::log::elevel::all);
-  // Initialize ASIO
-  websocketpp::lib::error_code error_code;
-  ws_client_.init_asio(error_code);
-  ws_client_.start_perpetual();
+  auto split_result = TdfStringUtil::SplitString(ws_uri, ":");
+  if (split_result.size() > 1 && split_result[0] == kWssKey) {
+    need_tls_ = true;
+  }
+  if (need_tls_) {
+    ws_client_ = std::make_shared<WebSocketTlsClient>();
+  } else {
+    ws_client_ = std::make_shared<WebSocketNoTlsClient>();
+  }
 }
 
 void WebSocketChannel::Connect(ReceiveDataHandler handler) {
@@ -49,118 +55,73 @@ void WebSocketChannel::Connect(ReceiveDataHandler handler) {
   }
   BACKEND_LOGI(TDF_BACKEND, "websocket connect url:%s", ws_uri_.c_str());
   data_handler_ = handler;
-  ws_client_.set_socket_init_handler(
-      [DEVTOOLS_WEAK_THIS](const websocketpp::connection_hdl& handle, websocketpp::lib::asio::ip::tcp::socket& socket) {
-        DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
-        self->HandleSocketInit(handle);
-      });
-  ws_client_.set_open_handler([DEVTOOLS_WEAK_THIS](const websocketpp::connection_hdl& handle) {
-    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
-    self->HandleSocketConnectOpen(handle);
-  });
-  ws_client_.set_close_handler([DEVTOOLS_WEAK_THIS](const websocketpp::connection_hdl& handle) {
-    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
-    self->HandleSocketConnectClose(handle);
-  });
-  ws_client_.set_fail_handler([DEVTOOLS_WEAK_THIS](const websocketpp::connection_hdl& handle) {
-    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
-    self->HandleSocketConnectFail(handle);
-  });
-  ws_client_.set_message_handler(
-      [DEVTOOLS_WEAK_THIS](const websocketpp::connection_hdl& handle, const WSMessagePtr& message_ptr) {
-        DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
-        self->HandleSocketConnectMessage(handle, message_ptr);
-      });
-
-  ws_thread_ = websocketpp::lib::make_shared<websocketpp::lib::thread>(&WSClient::run, &ws_client_);
-  StartConnect(ws_uri_);
+  ws_client_->SetNeedsHandler();
+  SetNeedsHandlers();
+  ws_client_->Connect(ws_uri_);
 }
 
 void WebSocketChannel::Send(const std::string& rsp_data) {
-  if (!connection_hdl_.lock()) {
+  if (ws_client_->GetStatus() != WebSocketStatus::kConnecting) {
     unset_messages_.emplace_back(rsp_data);
     return;
   }
-  websocketpp::lib::error_code error_code;
-  ws_client_.send(connection_hdl_, rsp_data, websocketpp::frame::opcode::text, error_code);
+  ws_client_->Send(rsp_data);
 }
 
 void WebSocketChannel::Close(int32_t code, const std::string& reason) {
-  if (!connection_hdl_.lock()) {
+  if (ws_client_->GetStatus() != WebSocketStatus::kConnecting) {
     BACKEND_LOGE(TDF_BACKEND, "send message error, handler is null");
     return;
   }
   BACKEND_LOGD(TDF_BACKEND, "close websocket, code: %d, reason: %s", code, reason.c_str());
-  websocketpp::lib::error_code error_code;
-  ws_client_.close(connection_hdl_, static_cast<websocketpp::close::status::value>(code), reason, error_code);
-  ws_client_.stop_perpetual();
+  ws_client_->Close(code, reason);
 }
 
-void WebSocketChannel::StartConnect(const std::string& ws_uri) {
-  websocketpp::lib::error_code error_code;
-  auto con = ws_client_.get_connection(ws_uri, error_code);
-
-  if (error_code) {
-    ws_client_.get_alog().write(websocketpp::log::alevel::app, error_code.message());
+void WebSocketChannel::SetNeedsHandlers() {
+  if (!ws_client_) {
     return;
   }
-
-  BACKEND_LOGI(TDF_BACKEND, "websocket start connect");
-  ws_client_.connect(con);
+  ws_client_->SetConnectOpenCallback([DEVTOOLS_WEAK_THIS]() {
+    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
+    self->HandleConnectOpen();
+  });
+  ws_client_->SetConnectFailCallback([DEVTOOLS_WEAK_THIS](int32_t fail_code, const std::string& fail_reason) {
+    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
+    self->HandleConnectFail();
+  });
+  ws_client_->SetReceiveMessageCallback([DEVTOOLS_WEAK_THIS](const std::string& message) {
+    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
+    self->HandleReceiveMessage(message);
+  });
+  ws_client_->SetCloseCallback([DEVTOOLS_WEAK_THIS](int32_t close_code, const std::string& close_reason) {
+    DEVTOOLS_DEFINE_AND_CHECK_SELF(WebSocketChannel)
+    self->HandleClose();
+  });
 }
 
-void WebSocketChannel::HandleSocketInit(const websocketpp::connection_hdl& handle) {
-  BACKEND_LOGI(TDF_BACKEND, "websocket init");
-}
-
-void WebSocketChannel::HandleSocketConnectFail(const websocketpp::connection_hdl& handle) {
-  websocketpp::lib::error_code error_code;
-  auto con = ws_client_.get_con_from_hdl(handle, error_code);
-  // set handle nullptr when connect fail
+void WebSocketChannel::HandleConnectFail() {
   data_handler_ = nullptr;
   unset_messages_.clear();
-  BACKEND_LOGE(TDF_BACKEND,
-               "websocket connect fail, state: %d, error message: %s, local close code: %d, local close reason: %s, "
-               "remote close code: %d, remote close reason: %s",
-               con->get_state(), con->get_ec().message().c_str(), con->get_local_close_code(),
-               con->get_local_close_reason().c_str(), con->get_remote_close_code(),
-               con->get_remote_close_reason().c_str());
 }
 
-void WebSocketChannel::HandleSocketConnectOpen(const websocketpp::connection_hdl& handle) {
-  connection_hdl_ = handle.lock();
-  BACKEND_LOGI(TDF_BACKEND, "websocket connect open");
-  if (!connection_hdl_.lock() || unset_messages_.empty()) {
+void WebSocketChannel::HandleConnectOpen() {
+  if (ws_client_->GetStatus() != WebSocketStatus::kConnecting || unset_messages_.empty()) {
     return;
   }
   for (auto& message : unset_messages_) {
-    websocketpp::lib::error_code error_code;
-    ws_client_.send(connection_hdl_, message, websocketpp::frame::opcode::text, error_code);
+    ws_client_->Send(message);
   }
   unset_messages_.clear();
 }
 
-void WebSocketChannel::HandleSocketConnectMessage(const websocketpp::connection_hdl& handle,
-                                                  const WSMessagePtr& message_ptr) {
-  auto message = message_ptr->get_payload();
+void WebSocketChannel::HandleReceiveMessage(const std::string& message) {
   if (data_handler_) {
-    std::string data(message.c_str(), message.length());
-    data_handler_(data, hippy::devtools::kTaskFlag);
+    data_handler_(message, hippy::devtools::kTaskFlag);
   }
-  BACKEND_LOGD(TDF_BACKEND, "websocket receive message");
 }
 
-void WebSocketChannel::HandleSocketConnectClose(const websocketpp::connection_hdl& handle) {
-  websocketpp::lib::error_code error_code;
-  auto con = ws_client_.get_con_from_hdl(handle, error_code);
-  // set handle nullptr when connect fail
+void WebSocketChannel::HandleClose() {
   data_handler_ = nullptr;
   unset_messages_.clear();
-  BACKEND_LOGI(TDF_BACKEND,
-               "websocket connect close, state: %d, error message: %s, local close code: %d, local close reason: %s, "
-               "remote close code: %d, remote close reason: %s",
-               con->get_state(), con->get_ec().message().c_str(), con->get_local_close_code(),
-               con->get_local_close_reason().c_str(), con->get_remote_close_code(),
-               con->get_remote_close_reason().c_str());
 }
 }  // namespace hippy::devtools
