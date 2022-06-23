@@ -46,6 +46,5 @@ class WebSocketChannel : public hippy::devtools::NetChannel, public std::enable_
   std::string ws_uri_;
   ReceiveDataHandler data_handler_;
   std::vector<std::string> unset_messages_{};
-  bool need_tls_ = false;
 };
 }  // namespace hippy::devtools

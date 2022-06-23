@@ -38,10 +38,11 @@ namespace hippy::devtools {
 WebSocketChannel::WebSocketChannel(const std::string& ws_uri) {
   ws_uri_ = ws_uri;
   auto split_result = TdfStringUtil::SplitString(ws_uri, ":");
+  bool need_tls = false;
   if (split_result.size() > 1 && split_result[0] == kWssKey) {
-    need_tls_ = true;
+    need_tls = true;
   }
-  if (need_tls_) {
+  if (need_tls) {
     ws_client_ = std::make_shared<WebSocketTlsClient>();
   } else {
     ws_client_ = std::make_shared<WebSocketNoTlsClient>();
